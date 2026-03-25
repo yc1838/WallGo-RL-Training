@@ -1,6 +1,7 @@
 from enum import Enum
 from collections import deque
 from typing import List, Tuple, Set, Dict, Optional
+import bisect
 import copy
 
 SIDES = ('top', 'right', 'bottom', 'left')
@@ -16,6 +17,8 @@ class Player(Enum):
     YELLOW = 'YELLOW'
 
 class CellData:
+    __slots__ = ('x', 'y', 'occupant', 'walls')
+
     def __init__(self, x: int, y: int):
         self.x = x
         self.y = y
@@ -57,15 +60,18 @@ class UnionFind:
 
 
 class WallGoEnv:
-    def __init__(self, size: int = 7):
+    def __init__(self, size: int = 7, allow_border_walls: bool = True):
         self.size = size
+        self.allow_border_walls = allow_border_walls
         self.board = self._create_initial_board()
         self.active_players: List[Player] = []
         self.current_player_idx: int = 0
         self.done: bool = False
+        self.turn_count: int = 0
         # Incremental tracking — avoids scanning the whole board each turn
         self._piece_positions: Dict[Player, List[Tuple[int, int]]] = {}
-        self._available_walls: Set[Tuple[int, int, str]] = set()
+        # Sorted list of canonical wall representations (deterministic ordering)
+        self._available_walls: List[Tuple[int, int, str]] = []
 
     def reset(self, players: Optional[List[Player]] = None):
         """Starts a new game and places the initial pieces."""
@@ -75,13 +81,18 @@ class WallGoEnv:
         self.active_players = list(players)
         self.current_player_idx = 0
         self.done = False
+        self.turn_count = 0
 
-        # Initialize available wall set (all wall slots open at start)
-        self._available_walls = set()
+        # Build deduplicated canonical wall set, then sort for determinism
+        walls = set()
         for y in range(self.size):
             for x in range(self.size):
                 for side in SIDES:
-                    self._available_walls.add((x, y, side))
+                    canon = self._canonical_wall(x, y, side)
+                    if not self.allow_border_walls and self._is_border_wall(*canon):
+                        continue
+                    walls.add(canon)
+        self._available_walls = sorted(walls)
 
         # Initialize piece positions
         self._piece_positions = {p: [] for p in self.active_players}
@@ -107,6 +118,33 @@ class WallGoEnv:
         return copy.deepcopy(self)
 
     # ------------------------------------------------------------------
+    # Wall canonicalization
+    # ------------------------------------------------------------------
+
+    def _canonical_wall(self, x: int, y: int, side: str) -> Tuple[int, int, str]:
+        """Return the canonical form of a wall.
+
+        Convention: for internal walls shared by two cells, keep the
+        'right' or 'bottom' form. Border walls with no neighbor stay as-is.
+        """
+        if side in ('left', 'top'):
+            dx, dy = SIDE_DELTA[side]
+            nx, ny = x + dx, y + dy
+            if self.is_valid_coordinate(nx, ny):
+                return (nx, ny, OPPOSITE[side])
+        return (x, y, side)
+
+    def _is_border_wall(self, x: int, y: int, side: str) -> bool:
+        """True if this wall borders the edge of the board (no strategic effect)."""
+        s = self.size
+        return (
+            (side == 'top' and y == 0) or
+            (side == 'bottom' and y == s - 1) or
+            (side == 'left' and x == 0) or
+            (side == 'right' and x == s - 1)
+        )
+
+    # ------------------------------------------------------------------
     # State representation
     # ------------------------------------------------------------------
 
@@ -116,6 +154,7 @@ class WallGoEnv:
             "board": self.board,
             "current_player": self.current_player,
             "numeric": self.encode_state(),
+            "turn": self.turn_count,
         }
 
     def encode_state(self) -> List[List[List[int]]]:
@@ -148,7 +187,7 @@ class WallGoEnv:
         return state
 
     # ------------------------------------------------------------------
-    # Legal action enumeration  (THE key addition for RL)
+    # Legal action enumeration
     # ------------------------------------------------------------------
 
     def get_player_pieces(self, player: Player) -> List[Tuple[int, int]]:
@@ -156,7 +195,7 @@ class WallGoEnv:
         return list(self._piece_positions[player])
 
     def get_valid_wall_placements(self) -> List[Tuple[int, int, str]]:
-        """Return all (x, y, side) where a wall can still be placed. O(k) where k = open slots."""
+        """Return all canonical (x, y, side) where a wall can still be placed."""
         return list(self._available_walls)
 
     def get_legal_actions(self) -> List[Tuple[int, int, int, int, int, int, str]]:
@@ -164,30 +203,20 @@ class WallGoEnv:
 
         This is the FULL action list the current player can choose from.
         For RL, an agent picks an index into this list each turn.
+        Wall coordinates are in canonical form.
         """
         if self.done:
             return []
 
         cur = self.current_player
         pieces = self.get_player_pieces(cur)
-        wall_slots = self.get_valid_wall_placements()
+        wall_slots = self._available_walls  # already sorted, no copy needed
         actions = []
 
         for (px, py) in pieces:
             for (mx, my) in self.get_valid_moves(px, py):
-                # Temporarily execute the move so wall validity reflects
-                # the board state AFTER moving (piece is now at mx, my).
-                self.board[py][px].occupant = None
-                self.board[my][mx].occupant = cur
-
                 for (wx, wy, ws) in wall_slots:
-                    # Wall slot must still be free (move doesn't affect walls,
-                    # so the pre-computed list is still valid).
                     actions.append((px, py, mx, my, wx, wy, ws))
-
-                # Undo temporary move
-                self.board[my][mx].occupant = None
-                self.board[py][px].occupant = cur
 
         return actions
 
@@ -199,6 +228,7 @@ class WallGoEnv:
         """Executes one full turn and returns (state, reward, done, info).
 
         action: (from_x, from_y, to_x, to_y, wall_x, wall_y, wall_side)
+        Wall coordinates are accepted in any form and canonicalized internally.
         """
         if self.done:
             return self._get_state(), 0, True, {"error": "Game already over"}
@@ -226,15 +256,22 @@ class WallGoEnv:
 
         # 3. Validate and execute wall placement
         if wall_side not in SIDES:
-            # Undo move + piece tracking
             self._undo_move(cur, from_x, from_y, to_x, to_y)
             return self._get_state(), -1, False, {"error": f"Invalid wall side: {wall_side}"}
+
+        # Canonicalize the wall coordinates
+        wall_x, wall_y, wall_side = self._canonical_wall(wall_x, wall_y, wall_side)
+
+        if not self.allow_border_walls and self._is_border_wall(wall_x, wall_y, wall_side):
+            self._undo_move(cur, from_x, from_y, to_x, to_y)
+            return self._get_state(), -1, False, {"error": "Border walls not allowed"}
 
         if not self.is_valid_coordinate(wall_x, wall_y) or self.board[wall_y][wall_x].walls[wall_side] is not None:
             self._undo_move(cur, from_x, from_y, to_x, to_y)
             return self._get_state(), -1, False, {"error": "Invalid wall placement"}
 
         self.place_wall(wall_x, wall_y, wall_side, cur)
+        self.turn_count += 1
 
         # 4. Check end condition + score in one pass (single Union-Find build)
         uf = self._build_union_find()
@@ -284,7 +321,6 @@ class WallGoEnv:
             return
 
         self.board[y][x].walls[side] = player
-        self._available_walls.discard((x, y, side))
 
         # Update the neighbour cell's matching wall
         dx, dy = SIDE_DELTA[side]
@@ -292,7 +328,12 @@ class WallGoEnv:
         if self.is_valid_coordinate(nx, ny):
             opp = OPPOSITE[side]
             self.board[ny][nx].walls[opp] = player
-            self._available_walls.discard((nx, ny, opp))
+
+        # Remove canonical form from the sorted available list
+        canon = self._canonical_wall(x, y, side)
+        idx = bisect.bisect_left(self._available_walls, canon)
+        if idx < len(self._available_walls) and self._available_walls[idx] == canon:
+            self._available_walls.pop(idx)
 
     def is_blocked(self, from_cell: CellData, to_cell: CellData) -> bool:
         """Checks if movement is blocked by a wall between two adjacent cells."""
@@ -338,11 +379,9 @@ class WallGoEnv:
         queue = deque()
         visited = set()
 
-        for y in range(self.size):
-            for x in range(self.size):
-                if self.board[y][x].occupant == player:
-                    queue.append((x, y))
-                    visited.add((x, y))
+        for (x, y) in self._piece_positions[player]:
+            queue.append((x, y))
+            visited.add((x, y))
 
         while queue:
             cx, cy = queue.popleft()
@@ -378,20 +417,26 @@ class WallGoEnv:
         return uf
 
     def _check_end_with_uf(self, uf: UnionFind, active_players: List[Player]) -> bool:
-        """Check if all players are separated using a pre-built Union-Find."""
-        s = self.size
-        player_roots: Dict[Player, int] = {}
-        for p in active_players:
-            for (x, y) in self._piece_positions[p]:
-                player_roots[p] = uf.find(y * s + x)
-                break  # one piece per player is enough
+        """Check if all players are separated using a pre-built Union-Find.
 
-        roots_seen: Dict[int, Player] = {}
-        for p, root in player_roots.items():
-            for other_root in roots_seen:
-                if uf.connected(root, other_root):
-                    return False
-            roots_seen[root] = p
+        Checks ALL pieces per player (handles multi-piece configurations).
+        """
+        s = self.size
+        # Collect all unique roots per player
+        player_roots: Dict[Player, Set[int]] = {}
+        for p in active_players:
+            roots = set()
+            for (x, y) in self._piece_positions[p]:
+                roots.add(uf.find(y * s + x))
+            player_roots[p] = roots
+
+        # Game ends when no two players share a connected component
+        for i, p1 in enumerate(active_players):
+            for p2 in active_players[i + 1:]:
+                for r1 in player_roots[p1]:
+                    for r2 in player_roots[p2]:
+                        if uf.connected(r1, r2):
+                            return False
         return True
 
     def _scores_with_uf(self, uf: UnionFind, active_players: List[Player]) -> Dict[Player, int]:
