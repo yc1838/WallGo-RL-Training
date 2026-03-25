@@ -6,6 +6,8 @@ import copy
 SIDES = ('top', 'right', 'bottom', 'left')
 OPPOSITE = {'top': 'bottom', 'bottom': 'top', 'left': 'right', 'right': 'left'}
 DIRECTIONS = [(0, -1), (0, 1), (-1, 0), (1, 0)]
+# Map wall side to the (dx, dy) of the adjacent cell sharing that wall
+SIDE_DELTA = {'top': (0, -1), 'bottom': (0, 1), 'left': (-1, 0), 'right': (1, 0)}
 
 class Player(Enum):
     RED = 'RED'
@@ -22,6 +24,38 @@ class CellData:
             'top': None, 'right': None, 'bottom': None, 'left': None
         }
 
+
+# ======================================================================
+# Union-Find (Disjoint Set) for fast connectivity checks
+# ======================================================================
+
+class UnionFind:
+    """Weighted union-find with path compression. O(alpha(n)) per operation."""
+
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]  # path halving
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+
+    def connected(self, a: int, b: int) -> bool:
+        return self.find(a) == self.find(b)
+
+
 class WallGoEnv:
     def __init__(self, size: int = 7):
         self.size = size
@@ -29,6 +63,9 @@ class WallGoEnv:
         self.active_players: List[Player] = []
         self.current_player_idx: int = 0
         self.done: bool = False
+        # Incremental tracking — avoids scanning the whole board each turn
+        self._piece_positions: Dict[Player, List[Tuple[int, int]]] = {}
+        self._available_walls: Set[Tuple[int, int, str]] = set()
 
     def reset(self, players: Optional[List[Player]] = None):
         """Starts a new game and places the initial pieces."""
@@ -39,12 +76,27 @@ class WallGoEnv:
         self.current_player_idx = 0
         self.done = False
 
+        # Initialize available wall set (all wall slots open at start)
+        self._available_walls = set()
+        for y in range(self.size):
+            for x in range(self.size):
+                for side in SIDES:
+                    self._available_walls.add((x, y, side))
+
+        # Initialize piece positions
+        self._piece_positions = {p: [] for p in self.active_players}
+
         # Basic 2-player setup for 7x7
         if len(self.active_players) == 2:
-            self.board[1][3].occupant = self.active_players[0]
-            self.board[5][3].occupant = self.active_players[1]
+            self._place_piece(self.active_players[0], 3, 1)
+            self._place_piece(self.active_players[1], 3, 5)
 
         return self._get_state()
+
+    def _place_piece(self, player: Player, x: int, y: int):
+        """Place a piece and update the tracking dict."""
+        self.board[y][x].occupant = player
+        self._piece_positions[player].append((x, y))
 
     @property
     def current_player(self) -> Player:
@@ -100,23 +152,12 @@ class WallGoEnv:
     # ------------------------------------------------------------------
 
     def get_player_pieces(self, player: Player) -> List[Tuple[int, int]]:
-        """Return (x, y) positions of all pieces belonging to player."""
-        pieces = []
-        for y in range(self.size):
-            for x in range(self.size):
-                if self.board[y][x].occupant == player:
-                    pieces.append((x, y))
-        return pieces
+        """Return (x, y) positions of all pieces belonging to player. O(1) lookup."""
+        return list(self._piece_positions[player])
 
     def get_valid_wall_placements(self) -> List[Tuple[int, int, str]]:
-        """Return all (x, y, side) where a wall can still be placed."""
-        placements = []
-        for y in range(self.size):
-            for x in range(self.size):
-                for side in SIDES:
-                    if self.board[y][x].walls[side] is None:
-                        placements.append((x, y, side))
-        return placements
+        """Return all (x, y, side) where a wall can still be placed. O(k) where k = open slots."""
+        return list(self._available_walls)
 
     def get_legal_actions(self) -> List[Tuple[int, int, int, int, int, int, str]]:
         """Enumerate every legal (from_x, from_y, to_x, to_y, wall_x, wall_y, wall_side).
@@ -176,29 +217,33 @@ class WallGoEnv:
 
         self.board[from_y][from_x].occupant = None
         self.board[to_y][to_x].occupant = cur
+        # Update piece position tracking
+        pieces = self._piece_positions[cur]
+        for i, (px, py) in enumerate(pieces):
+            if px == from_x and py == from_y:
+                pieces[i] = (to_x, to_y)
+                break
 
         # 3. Validate and execute wall placement
         if wall_side not in SIDES:
-            # Undo move
-            self.board[to_y][to_x].occupant = None
-            self.board[from_y][from_x].occupant = cur
+            # Undo move + piece tracking
+            self._undo_move(cur, from_x, from_y, to_x, to_y)
             return self._get_state(), -1, False, {"error": f"Invalid wall side: {wall_side}"}
 
         if not self.is_valid_coordinate(wall_x, wall_y) or self.board[wall_y][wall_x].walls[wall_side] is not None:
-            # Undo move
-            self.board[to_y][to_x].occupant = None
-            self.board[from_y][from_x].occupant = cur
+            self._undo_move(cur, from_x, from_y, to_x, to_y)
             return self._get_state(), -1, False, {"error": "Invalid wall placement"}
 
         self.place_wall(wall_x, wall_y, wall_side, cur)
 
-        # 4. Check end condition
-        self.done = self.check_game_end_condition(self.active_players)
+        # 4. Check end condition + score in one pass (single Union-Find build)
+        uf = self._build_union_find()
+        self.done = self._check_end_with_uf(uf, self.active_players)
 
         reward = 0
         info = {}
         if self.done:
-            scores = self.calculate_scores(self.active_players)
+            scores = self._scores_with_uf(uf, self.active_players)
             my_score = scores.get(cur, 0)
             opponent_score = max(s for p, s in scores.items() if p != cur)
 
@@ -223,19 +268,31 @@ class WallGoEnv:
     def is_valid_coordinate(self, x: int, y: int) -> bool:
         return 0 <= x < self.size and 0 <= y < self.size
 
+    def _undo_move(self, player: Player, from_x: int, from_y: int, to_x: int, to_y: int):
+        """Revert a piece move and its tracking data."""
+        self.board[to_y][to_x].occupant = None
+        self.board[from_y][from_x].occupant = player
+        pieces = self._piece_positions[player]
+        for i, (px, py) in enumerate(pieces):
+            if px == to_x and py == to_y:
+                pieces[i] = (from_x, from_y)
+                break
+
     def place_wall(self, x: int, y: int, side: str, player: Player):
-        """Places a wall and updates the adjacent cell's wall reference."""
+        """Places a wall and updates the adjacent cell + available wall tracking."""
         if not self.is_valid_coordinate(x, y) or side not in SIDES:
             return
 
         self.board[y][x].walls[side] = player
+        self._available_walls.discard((x, y, side))
 
         # Update the neighbour cell's matching wall
-        adj = {'top': (0, -1), 'bottom': (0, 1), 'left': (-1, 0), 'right': (1, 0)}
-        dx, dy = adj[side]
+        dx, dy = SIDE_DELTA[side]
         nx, ny = x + dx, y + dy
         if self.is_valid_coordinate(nx, ny):
-            self.board[ny][nx].walls[OPPOSITE[side]] = player
+            opp = OPPOSITE[side]
+            self.board[ny][nx].walls[opp] = player
+            self._available_walls.discard((nx, ny, opp))
 
     def is_blocked(self, from_cell: CellData, to_cell: CellData) -> bool:
         """Checks if movement is blocked by a wall between two adjacent cells."""
@@ -303,38 +360,66 @@ class WallGoEnv:
 
         return visited
 
-    def check_game_end_condition(self, active_players: List[Player]) -> bool:
-        """BFS to check if any active player can reach another active player."""
-        for p1 in active_players:
-            queue = deque()
-            visited = set()
+    def _build_union_find(self) -> UnionFind:
+        """Build a Union-Find over all cells, merging adjacent cells with no wall between them.
 
-            for y in range(self.size):
-                for x in range(self.size):
-                    if self.board[y][x].occupant == p1:
-                        queue.append((x, y))
-                        visited.add((x, y))
+        Single O(n^2) pass replaces multiple BFS traversals.
+        """
+        s = self.size
+        uf = UnionFind(s * s)
+        for y in range(s):
+            for x in range(s):
+                cell = self.board[y][x]
+                # Only need to check right and bottom to cover all edges once
+                if x + 1 < s and cell.walls['right'] is None:
+                    uf.union(y * s + x, y * s + (x + 1))
+                if y + 1 < s and cell.walls['bottom'] is None:
+                    uf.union(y * s + x, (y + 1) * s + x)
+        return uf
 
-            while queue:
-                cx, cy = queue.popleft()
-                for dx, dy in DIRECTIONS:
-                    nx, ny = cx + dx, cy + dy
+    def _check_end_with_uf(self, uf: UnionFind, active_players: List[Player]) -> bool:
+        """Check if all players are separated using a pre-built Union-Find."""
+        s = self.size
+        player_roots: Dict[Player, int] = {}
+        for p in active_players:
+            for (x, y) in self._piece_positions[p]:
+                player_roots[p] = uf.find(y * s + x)
+                break  # one piece per player is enough
 
-                    if self.is_valid_coordinate(nx, ny):
-                        current_cell = self.board[cy][cx]
-                        next_cell = self.board[ny][nx]
-
-                        if not self.is_blocked(current_cell, next_cell):
-                            if next_cell.occupant and next_cell.occupant != p1 and next_cell.occupant in active_players:
-                                return False
-                            if next_cell.occupant is None and (nx, ny) not in visited:
-                                visited.add((nx, ny))
-                                queue.append((nx, ny))
-
+        roots_seen: Dict[int, Player] = {}
+        for p, root in player_roots.items():
+            for other_root in roots_seen:
+                if uf.connected(root, other_root):
+                    return False
+            roots_seen[root] = p
         return True
 
-    def calculate_scores(self, active_players: List[Player]) -> Dict[Player, int]:
-        scores = {}
+    def _scores_with_uf(self, uf: UnionFind, active_players: List[Player]) -> Dict[Player, int]:
+        """Calculate territory scores using a pre-built Union-Find."""
+        s = self.size
+
+        component_size: Dict[int, int] = {}
+        for y in range(s):
+            for x in range(s):
+                root = uf.find(y * s + x)
+                component_size[root] = component_size.get(root, 0) + 1
+
+        scores: Dict[Player, int] = {}
         for p in active_players:
-            scores[p] = len(self.get_reachable_area(p))
+            seen_roots: Set[int] = set()
+            total = 0
+            for (x, y) in self._piece_positions[p]:
+                root = uf.find(y * s + x)
+                if root not in seen_roots:
+                    seen_roots.add(root)
+                    total += component_size[root]
+            scores[p] = total
         return scores
+
+    def check_game_end_condition(self, active_players: List[Player]) -> bool:
+        """Public API: check if all players are fully separated."""
+        return self._check_end_with_uf(self._build_union_find(), active_players)
+
+    def calculate_scores(self, active_players: List[Player]) -> Dict[Player, int]:
+        """Public API: calculate territory scores."""
+        return self._scores_with_uf(self._build_union_find(), active_players)
