@@ -2,7 +2,6 @@ from enum import Enum
 from collections import deque
 from typing import List, Tuple, Set, Dict, Optional
 import bisect
-import copy
 
 SIDES = ('top', 'right', 'bottom', 'left')
 OPPOSITE = {'top': 'bottom', 'bottom': 'top', 'left': 'right', 'right': 'left'}
@@ -114,8 +113,31 @@ class WallGoEnv:
         return self.active_players[self.current_player_idx]
 
     def clone(self) -> 'WallGoEnv':
-        """Deep copy of the entire game state. Essential for MCTS / lookahead."""
-        return copy.deepcopy(self)
+        """Fast manual copy of the game state (avoids slow deepcopy)."""
+        c = WallGoEnv.__new__(WallGoEnv)
+        c.size = self.size
+        c.allow_border_walls = self.allow_border_walls
+        c.active_players = list(self.active_players)
+        c.current_player_idx = self.current_player_idx
+        c.done = self.done
+        c.turn_count = self.turn_count
+        # Copy board — each CellData gets a shallow copy with a new walls dict
+        c.board = []
+        for row in self.board:
+            new_row = []
+            for cell in row:
+                nc = CellData.__new__(CellData)
+                nc.x = cell.x
+                nc.y = cell.y
+                nc.occupant = cell.occupant
+                nc.walls = dict(cell.walls)
+                new_row.append(nc)
+            c.board.append(new_row)
+        # Copy piece positions (list of lists of tuples)
+        c._piece_positions = {p: list(v) for p, v in self._piece_positions.items()}
+        # Copy available walls (list of tuples — tuples are immutable, list copy suffices)
+        c._available_walls = list(self._available_walls)
+        return c
 
     # ------------------------------------------------------------------
     # Wall canonicalization
@@ -158,7 +180,7 @@ class WallGoEnv:
         }
 
     def encode_state(self) -> List[List[List[int]]]:
-        """Numeric board encoding as plain nested lists (no numpy needed).
+        """Numeric board encoding as plain nested lists.
 
         Returns a [C, size, size] tensor-like structure with channels:
           0 - current player's pieces
@@ -168,22 +190,35 @@ class WallGoEnv:
           4 - walls: bottom
           5 - walls: left
         Values are 0 or 1.
+
+        Optimized: uses piece position tracking and direct wall dict access
+        to avoid redundant occupant checks on empty cells.
         """
         s = self.size
         cur = self.current_player
         # Create 6 channels of zeros
         state = [[[0] * s for _ in range(s)] for _ in range(6)]
 
+        # Pieces — use tracked positions instead of scanning the board
+        for p in self.active_players:
+            ch = 0 if p == cur else 1
+            for x, y in self._piece_positions[p]:
+                state[ch][y][x] = 1
+
+        # Walls — still need full scan but avoid enumerate overhead
+        board = self.board
         for y in range(s):
+            row = board[y]
             for x in range(s):
-                cell = self.board[y][x]
-                if cell.occupant == cur:
-                    state[0][y][x] = 1
-                elif cell.occupant is not None:
-                    state[1][y][x] = 1
-                for idx, side in enumerate(SIDES):
-                    if cell.walls[side] is not None:
-                        state[2 + idx][y][x] = 1
+                walls = row[x].walls
+                if walls['top'] is not None:
+                    state[2][y][x] = 1
+                if walls['right'] is not None:
+                    state[3][y][x] = 1
+                if walls['bottom'] is not None:
+                    state[4][y][x] = 1
+                if walls['left'] is not None:
+                    state[5][y][x] = 1
         return state
 
     # ------------------------------------------------------------------
@@ -348,29 +383,34 @@ class WallGoEnv:
         return True
 
     def get_valid_moves(self, start_x: int, start_y: int) -> List[Tuple[int, int]]:
-        """BFS to find valid moves (0, 1, or 2 steps)."""
+        """BFS to find valid moves (0, 1, or 2 steps).
+
+        Optimized: inlines wall checks and avoids method call overhead.
+        """
         valid_moves = [(start_x, start_y)]  # 0 steps (stay) is valid
-        queue = deque([((start_x, start_y), 0)])
+        board = self.board
+        size = self.size
+        # Use a flat list as queue for 2-level BFS (faster than deque for tiny queues)
+        # Level 0: start, Level 1: 1-step neighbours, Level 2: 2-step neighbours
         visited = {(start_x, start_y)}
+        _WALL_FOR_DIR = {(0, -1): 'top', (0, 1): 'bottom', (-1, 0): 'left', (1, 0): 'right'}
 
-        while queue:
-            (cx, cy), dist = queue.popleft()
-
-            if dist >= 2:
-                continue
-
-            for dx, dy in DIRECTIONS:
-                nx, ny = cx + dx, cy + dy
-
-                if self.is_valid_coordinate(nx, ny):
-                    current_cell = self.board[cy][cx]
-                    target_cell = self.board[ny][nx]
-
-                    if not self.is_blocked(current_cell, target_cell) and target_cell.occupant is None:
-                        if (nx, ny) not in visited:
+        # BFS level 1
+        level = [(start_x, start_y)]
+        for depth in range(2):
+            next_level = []
+            for cx, cy in level:
+                cell_walls = board[cy][cx].walls
+                for (dx, dy), wall_side in _WALL_FOR_DIR.items():
+                    if cell_walls[wall_side] is not None:
+                        continue
+                    nx, ny = cx + dx, cy + dy
+                    if 0 <= nx < size and 0 <= ny < size and (nx, ny) not in visited:
+                        if board[ny][nx].occupant is None:
                             visited.add((nx, ny))
                             valid_moves.append((nx, ny))
-                            queue.append(((nx, ny), dist + 1))
+                            next_level.append((nx, ny))
+            level = next_level
 
         return valid_moves
 
