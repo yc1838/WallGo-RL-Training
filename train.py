@@ -31,10 +31,11 @@ from action_encoding import ACTION_SPACE_SIZE
 from evaluate import RandomAgent, evaluate
 
 class ModelAgent:
-    def __init__(self, model):
+    def __init__(self, model, deterministic=True):
         self.model = model
+        self.deterministic = deterministic
     def select_action(self, obs, mask, **kwargs):
-        action, _ = self.model.predict(obs, action_masks=mask, deterministic=True)
+        action, _ = self.model.predict(obs, action_masks=mask, deterministic=self.deterministic)
         return int(action)
 
 
@@ -191,6 +192,8 @@ class CuteReporterCallback(BaseCallback):
         self.recent_games = 0
         self.last_recent_wins = 0
         self.last_recent_games = 0
+        self.current_checkpoint = "—"
+        self.current_opponent = "Random"
         
     def _on_step(self):
         viz_completed = min(self.num_timesteps, self.total_steps)
@@ -222,12 +225,16 @@ class CuteReporterCallback(BaseCallback):
             cyber_title = "[bold #ff00ff]///[/bold #ff00ff] [bold #00ffcc]NEURAL-LNK SYS // WALLGO-RL[/bold #00ffcc] [bold #ff00ff]///[/bold #ff00ff]"
             stats_text = f"""
 [bold #00ffcc]▰▰▰ SYSTEM METRICS ▰▰▰[/bold #00ffcc]
-[bold #ff00ff]▶ TOTAL SIMULATIONS:[/bold #ff00ff] [bold white]{total}[/bold white]
-[bold #ff00ff]▶ WIN/LOSS/TIE RATIO:[/bold #ff00ff] [bold #00FF00]{self.wins}[/bold #00FF00] / [bold #FF0055]{self.losses}[/bold #FF0055] / [bold #00CCFF]{self.ties}[/bold #00CCFF]
+[bold #ff00ff]▶ TOTAL GAMES PLAYED:[/bold #ff00ff] [bold white]{total:,}[/bold white]
+[bold #ff00ff]▶ WIN / LOSS / TIE:[/bold #ff00ff] [bold #00FF00]{self.wins:,}[/bold #00FF00] / [bold #FF0055]{self.losses:,}[/bold #FF0055] / [bold #00CCFF]{self.ties:,}[/bold #00CCFF]
 
 [bold #fcee0a]▰▰▰ ALGORITHMIC EFFICIENCY ▰▰▰[/bold #fcee0a]
-[bold #fcee0a]▶ GLOBAL DOMINANCE:[/bold #fcee0a] [bold white]{win_rate_all:.1f}%[/bold white]
-[bold #fcee0a]▶ RECENT ACCURACY (n={self.check_interval}):[/bold #fcee0a] [bold white]{recent_wr:.1f}%[/bold white]
+[bold #fcee0a]▶ GLOBAL WIN RATE:[/bold #fcee0a] [bold white]{win_rate_all:.1f}%[/bold white]
+[bold #fcee0a]▶ RECENT WIN RATE (last {self.check_interval:,} steps):[/bold #fcee0a] [bold white]{recent_wr:.1f}%[/bold white]
+
+[bold #87CEEB]▰▰▰ CHECKPOINT STATUS ▰▰▰[/bold #87CEEB]
+[bold #87CEEB]▶ LATEST SAVE:[/bold #87CEEB] [bold white]{self.current_checkpoint}[/bold white]
+[bold #87CEEB]▶ CURRENT OPPONENT:[/bold #87CEEB] [bold white]{self.current_opponent}[/bold white]
 """
             group = Group(
                 Text.from_markup(stats_text, justify="left"),
@@ -342,15 +349,18 @@ def train(
             path = os.path.join(save_dir, f"wallgo_{steps_done}")
             model.save(path)
             past_models.append(path)
-            live.console.print(f"[bold green]✓ Checkpoint saved: {path}[/bold green]")
+            total_games = ui_callback.wins + ui_callback.losses + ui_callback.ties
+            ui_callback.current_checkpoint = f"wallgo_{steps_done} ({total_games:,} games)"
+            live.console.print(f"[bold green]✓ Checkpoint saved: wallgo_{steps_done} (total games: {total_games:,})[/bold green]")
 
             # Update opponent
             if random.random() < 0.2:
                 chosen = past_models[-1]
             else:
                 chosen = random.choice(past_models)
-                
-            live.console.print(f"[bold #FF9900]➜ Self-Play: Updating opponent pool to {os.path.basename(chosen)}[/bold #FF9900]")
+
+            ui_callback.current_opponent = os.path.basename(chosen).replace(".zip", "")
+            live.console.print(f"[bold #FF9900]➜ Self-Play: Opponent → {ui_callback.current_opponent}[/bold #FF9900]")
             if n_envs > 1:
                 vec_env.env_method("set_opponent_path", chosen)
             else:
@@ -375,7 +385,7 @@ def train(
                     )
                     dev = "mps" if torch.backends.mps.is_available() else "auto"
                     baseline_model = MaskablePPO.load(baseline_path, env=env_to_use, device=dev)
-                    metrics_base = evaluate(ModelAgent(model), num_games=eval_games, opponent=ModelAgent(baseline_model))
+                    metrics_base = evaluate(ModelAgent(model), num_games=eval_games, opponent=ModelAgent(baseline_model, deterministic=False))
                     live.console.print(f"  [bold magenta]Eval vs {os.path.basename(baseline_path)}:[/bold magenta] W/L/T=[{metrics_base['win_rate']:.2f}/{metrics_base['loss_rate']:.2f}/{metrics_base['tie_rate']:.2f}], "
                           f"len={metrics_base['avg_game_length']:.1f}, "
                           f"diff={metrics_base['avg_territory_diff']:.1f}")
