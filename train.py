@@ -30,6 +30,13 @@ from wallgo_gym import WallGoGymEnv
 from action_encoding import ACTION_SPACE_SIZE
 from evaluate import RandomAgent, evaluate
 
+class ModelAgent:
+    def __init__(self, model):
+        self.model = model
+    def select_action(self, obs, mask, **kwargs):
+        action, _ = self.model.predict(obs, action_masks=mask, deterministic=True)
+        return int(action)
+
 
 # ======================================================================
 # Self-play environment
@@ -212,26 +219,21 @@ class CuteReporterCallback(BaseCallback):
                 
             recent_wr = (self.last_recent_wins / max(1, self.last_recent_games)) * 100 if self.last_recent_games else win_rate_all
             
-            claude_art = """[#C15F3C]
-   █████████████   
-   ██ ███████ ██   
-  █████████████████
-   █████████████   
-    █ █     █ █    [/#C15F3C]"""
-            
+            cyber_title = "[bold #ff00ff]///[/bold #ff00ff] [bold #00ffcc]NEURAL-LNK SYS // WALLGO-RL[/bold #00ffcc] [bold #ff00ff]///[/bold #ff00ff]"
             stats_text = f"""
-[bold yellow]Total Games:[/bold yellow] {total}
-[bold green]Wins:[/bold green] {self.wins}  [bold red]Losses:[/bold red] {self.losses}  [bold blue]Ties:[/bold blue] {self.ties}
+[bold #00ffcc]▰▰▰ SYSTEM METRICS ▰▰▰[/bold #00ffcc]
+[bold #ff00ff]▶ TOTAL SIMULATIONS:[/bold #ff00ff] [bold white]{total}[/bold white]
+[bold #ff00ff]▶ WIN/LOSS/TIE RATIO:[/bold #ff00ff] [bold #00FF00]{self.wins}[/bold #00FF00] / [bold #FF0055]{self.losses}[/bold #FF0055] / [bold #00CCFF]{self.ties}[/bold #00CCFF]
 
-[bold cyan]Global Win Rate:[/bold cyan] {win_rate_all:.1f}%
-[bold magenta]Recent Win Rate ({self.check_interval} steps):[/bold magenta] {recent_wr:.1f}%
+[bold #fcee0a]▰▰▰ ALGORITHMIC EFFICIENCY ▰▰▰[/bold #fcee0a]
+[bold #fcee0a]▶ GLOBAL DOMINANCE:[/bold #fcee0a] [bold white]{win_rate_all:.1f}%[/bold white]
+[bold #fcee0a]▶ RECENT ACCURACY (n={self.check_interval}):[/bold #fcee0a] [bold white]{recent_wr:.1f}%[/bold white]
 """
             group = Group(
-                Text.from_markup(claude_art, justify="center"),
-                Text.from_markup(stats_text, justify="center"),
+                Text.from_markup(stats_text, justify="left"),
                 self.progress
             )
-            self.live.update(Panel(group, title="[bold orange3]🧠 WallGo Self-Play[/bold orange3]", border_style="orange3"))
+            self.live.update(Panel(group, title=cyber_title, border_style="#00ffcc", padding=(1, 2)))
             
         return True
 
@@ -246,7 +248,7 @@ def train(
     learning_rate: float = 3e-4,
     reward_shaping: bool = True,
     eval_interval: int = 20_000,
-    eval_games: int = 20,
+    eval_games: int = 200,
     n_envs: int = 1,
     resume: bool = False,
 ):
@@ -276,10 +278,19 @@ def train(
 
     # Setup/Load Model
     steps_done = 0
+    last_eval_step = 0
     if resume and past_models:
         latest = past_models[-1]
         steps_done = get_step(latest)
-        model = MaskablePPO.load(latest, env=env_to_use, custom_objects={"learning_rate": learning_rate})
+        last_eval_step = steps_done
+        
+        # Override saved hyperparameters to speed up the "thinking" phase
+        _device = "mps" if torch.backends.mps.is_available() else "auto"
+        custom_objects = {
+            "learning_rate": learning_rate,
+            "n_epochs": 4,          # Reduced from 10 to 4 for 2.5x faster gradient updates
+        }
+        model = MaskablePPO.load(latest, env=env_to_use, device=_device, custom_objects=custom_objects)
     else:
         policy_kwargs = dict(
             features_extractor_class=WallGoCNN,
@@ -293,10 +304,20 @@ def train(
             policy_kwargs=policy_kwargs,
             n_steps=2048,
             batch_size=512,
-            n_epochs=10,
+            n_epochs=4,             # Reduced from 10 to 4 for faster updates
             gamma=0.99,
             verbose=0,
+            device="mps" if torch.backends.mps.is_available() else "auto",
         )
+
+    # Print startup diagnostics so you can verify device & engine
+    print(f"[startup] PyTorch device: {model.device}")
+    print(f"[startup] MPS available: {torch.backends.mps.is_available()}")
+    try:
+        import wallgo_rs
+        print("[startup] Engine: Rust (wallgo_rs)")
+    except ImportError:
+        print("[startup] Engine: Python (wallgo.py)")
 
     progress = Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -313,7 +334,9 @@ def train(
         while steps_done < total_timesteps:
             chunk = min(save_interval, total_timesteps - steps_done)
             model.learn(total_timesteps=chunk, reset_num_timesteps=False, callback=ui_callback)
-            steps_done += chunk
+            
+            # Sync Python checkpoint tracking with PPO's true internal steps!
+            steps_done = model.num_timesteps
 
             # Save checkpoint
             path = os.path.join(save_dir, f"wallgo_{steps_done}")
@@ -334,11 +357,28 @@ def train(
                 single_env.set_opponent_path(chosen)
 
             # Periodic evaluation
-            if steps_done % eval_interval == 0 or steps_done >= total_timesteps:
-                metrics = evaluate(RandomAgent(), num_games=eval_games)
-                live.console.print(f"  [bold cyan]Eval vs random:[/bold cyan] win_rate={metrics['win_rate']:.2f}, "
-                      f"avg_len={metrics['avg_game_length']:.1f}, "
-                      f"territory_diff={metrics['avg_territory_diff']:.1f}")
+            if steps_done - last_eval_step >= eval_interval or steps_done >= total_timesteps:
+                last_eval_step = steps_done
+                # 1. Eval vs random
+                metrics_rnd = evaluate(ModelAgent(model), num_games=eval_games)
+                live.console.print(f"  [bold cyan]Eval vs Random:[/bold cyan] W/L/T=[{metrics_rnd['win_rate']:.2f}/{metrics_rnd['loss_rate']:.2f}/{metrics_rnd['tie_rate']:.2f}], "
+                      f"len={metrics_rnd['avg_game_length']:.1f}, "
+                      f"diff={metrics_rnd['avg_territory_diff']:.1f}")
+                
+                # 2. Eval vs a meaningful baseline (~500k steps behind current)
+                if len(past_models) >= 2:
+                    target_step = steps_done - 500_000
+                    # Pick the checkpoint closest to target_step (but not the current one)
+                    baseline_path = min(
+                        past_models[:-1],
+                        key=lambda p: abs(get_step(p) - target_step),
+                    )
+                    dev = "mps" if torch.backends.mps.is_available() else "auto"
+                    baseline_model = MaskablePPO.load(baseline_path, env=env_to_use, device=dev)
+                    metrics_base = evaluate(ModelAgent(model), num_games=eval_games, opponent=ModelAgent(baseline_model))
+                    live.console.print(f"  [bold magenta]Eval vs {os.path.basename(baseline_path)}:[/bold magenta] W/L/T=[{metrics_base['win_rate']:.2f}/{metrics_base['loss_rate']:.2f}/{metrics_base['tie_rate']:.2f}], "
+                          f"len={metrics_base['avg_game_length']:.1f}, "
+                          f"diff={metrics_base['avg_territory_diff']:.1f}")
 
     # Save final model
     final_path = os.path.join(save_dir, "wallgo_final")
@@ -355,11 +395,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train WallGo RL agent")
     parser.add_argument("--steps", type=int, default=100_000)
     parser.add_argument("--save-dir", type=str, default="checkpoints")
-    parser.add_argument("--save-interval", type=int, default=10_000)
+    parser.add_argument("--save-interval", type=int, default=100_000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--no-shaping", action="store_true")
-    parser.add_argument("--eval-interval", type=int, default=20_000)
-    parser.add_argument("--eval-games", type=int, default=20)
+    parser.add_argument("--eval-interval", type=int, default=100_000)
+    parser.add_argument("--eval-games", type=int, default=200)
     parser.add_argument("--n-envs", type=int, default=1,
                         help="Parallel envs (e.g. 4 or 8 for M1)")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")

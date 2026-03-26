@@ -10,7 +10,10 @@ import argparse
 import numpy as np
 from typing import Optional, Dict
 
-from wallgo import WallGoEnv, Player
+try:
+    from wallgo_rs import WallGoEnv, Player
+except ImportError:
+    from wallgo import WallGoEnv, Player
 from wallgo_gym import WallGoGymEnv
 from action_encoding import (
     ACTION_SPACE_SIZE, decode_action, encode_action, get_action_mask,
@@ -95,9 +98,11 @@ def evaluate(
         opponent = RandomAgent()
 
     if num_games == 0:
-        return {"win_rate": 0.0, "avg_game_length": 0.0, "avg_territory_diff": 0.0}
+        return {"win_rate": 0.0, "loss_rate": 0.0, "tie_rate": 0.0, "avg_game_length": 0.0, "avg_territory_diff": 0.0}
 
     wins = 0
+    losses = 0
+    ties = 0
     total_length = 0
     total_territory_diff = 0.0
 
@@ -122,24 +127,27 @@ def evaluate(
             turn += 1
 
             if terminated or truncated:
-                # reward is from perspective of the player who just moved
-                # For agent (even turns): positive reward on even turn = agent win
-                # But env alternates internally, so we track via info
                 if terminated and "scores" in info:
                     scores = info["scores"]
-                    players = list(scores.keys())
-                    if len(players) >= 2:
-                        p1_score = scores[players[0]]
-                        p2_score = scores[players[1]]
-                        total_territory_diff += p1_score - p2_score
-                        if p1_score > p2_score:
-                            wins += 1
+                    # Agent is always RED (player 0), opponent is BLUE (player 1)
+                    # Use explicit keys — don't rely on dict ordering
+                    agent_score = scores.get("RED", 0)
+                    opp_score = scores.get("BLUE", 0)
+                    total_territory_diff += agent_score - opp_score
+                    if agent_score > opp_score:
+                        wins += 1
+                    elif agent_score < opp_score:
+                        losses += 1
+                    else:
+                        ties += 1
 
                 total_length += turn
                 break
 
     return {
         "win_rate": wins / num_games,
+        "loss_rate": losses / num_games,
+        "tie_rate": ties / num_games,
         "avg_game_length": total_length / num_games,
         "avg_territory_diff": total_territory_diff / num_games,
     }

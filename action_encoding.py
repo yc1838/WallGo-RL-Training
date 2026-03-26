@@ -9,7 +9,10 @@ implicit — we only encode (to_x, to_y, wall_x, wall_y, wall_side).
 
 import numpy as np
 from typing import Tuple
-from wallgo import WallGoEnv, SIDES
+try:
+    from wallgo_rs import WallGoEnv, SIDES
+except ImportError:
+    from wallgo import WallGoEnv, SIDES
 
 BOARD_SIZE = 7
 NUM_CELLS = BOARD_SIZE * BOARD_SIZE  # 49

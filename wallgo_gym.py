@@ -12,7 +12,12 @@ from gymnasium import spaces
 import numpy as np
 from typing import Optional, Tuple, Dict, Any
 
-from wallgo import WallGoEnv, Player
+try:
+    from wallgo_rs import WallGoEnv, Player
+    _USE_RUST = True
+except ImportError:
+    from wallgo import WallGoEnv, Player
+    _USE_RUST = False
 from action_encoding import (
     ACTION_SPACE_SIZE, BOARD_SIZE, encode_action, decode_action, get_action_mask,
 )
@@ -91,6 +96,8 @@ class WallGoGymEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def action_masks(self) -> np.ndarray:
+        if _USE_RUST:
+            return np.asarray(self._env.get_action_mask_np())
         return get_action_mask(self._env)
 
     # ------------------------------------------------------------------
@@ -98,6 +105,8 @@ class WallGoGymEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _encode_obs(self) -> np.ndarray:
+        if _USE_RUST:
+            return np.asarray(self._env.encode_state_np())
         nested = self._env.encode_state()
         return np.array(nested, dtype=np.float32)
 
@@ -107,8 +116,7 @@ class WallGoGymEnv(gym.Env):
         total_cells = BOARD_SIZE * BOARD_SIZE
 
         # Territory differential
-        uf = self._env._build_union_find()
-        scores = self._env._scores_with_uf(uf, self._env.active_players)
+        scores = self._env.calculate_scores(self._env.active_players)
         my_score = scores.get(cur, 0)
         opp_score = max((s for p, s in scores.items() if p != cur), default=0)
         territory_reward = 0.01 * (my_score - opp_score) / total_cells
