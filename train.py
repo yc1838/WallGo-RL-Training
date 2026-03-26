@@ -258,6 +258,7 @@ def train(
     eval_games: int = 200,
     n_envs: int = 1,
     resume: bool = False,
+    no_ui: bool = False,
 ):
     """Run the full self-play training loop."""
     os.makedirs(save_dir, exist_ok=True)
@@ -326,41 +327,32 @@ def train(
     except ImportError:
         print("[startup] Engine: Python (wallgo.py)")
 
-    progress = Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=None),
-        MofNCompleteColumn(),
-        "[progress.percentage]{task.percentage:>3.0f}%",
-        TimeElapsedColumn(),
-    )
-    task_id = progress.add_task("[orange3]Training Model...", total=total_timesteps, completed=steps_done)
-    
-    with Live(refresh_per_second=4, console=None) as live:
-        ui_callback = CuteReporterCallback(live, progress, task_id, check_interval=10_000, total_steps=total_timesteps)
+    if no_ui:
+        # ---- Colab / headless mode: plain print, no rich ----
+        import sys, time as _time
+        _train_start = _time.time()
 
         while steps_done < total_timesteps:
             chunk = min(save_interval, total_timesteps - steps_done)
-            model.learn(total_timesteps=chunk, reset_num_timesteps=False, callback=ui_callback)
-            
-            # Sync Python checkpoint tracking with PPO's true internal steps!
+            model.learn(total_timesteps=chunk, reset_num_timesteps=False)
             steps_done = model.num_timesteps
+
+            elapsed = _time.time() - _train_start
+            pct = steps_done / total_timesteps * 100
+            print(f"[{elapsed:.0f}s] Steps: {steps_done:,}/{total_timesteps:,} ({pct:.1f}%)", flush=True)
 
             # Save checkpoint
             path = os.path.join(save_dir, f"wallgo_{steps_done}")
             model.save(path)
             past_models.append(path)
-            total_games = ui_callback.wins + ui_callback.losses + ui_callback.ties
-            ui_callback.current_checkpoint = f"wallgo_{steps_done} ({total_games:,} games)"
-            live.console.print(f"[bold green]✓ Checkpoint saved: wallgo_{steps_done} (total games: {total_games:,})[/bold green]")
+            print(f"  ✓ Checkpoint saved: wallgo_{steps_done}", flush=True)
 
             # Update opponent
             if random.random() < 0.2:
                 chosen = past_models[-1]
             else:
                 chosen = random.choice(past_models)
-
-            ui_callback.current_opponent = os.path.basename(chosen).replace(".zip", "")
-            live.console.print(f"[bold #FF9900]➜ Self-Play: Opponent → {ui_callback.current_opponent}[/bold #FF9900]")
+            print(f"  → Opponent: {os.path.basename(chosen)}", flush=True)
             if n_envs > 1:
                 vec_env.env_method("set_opponent_path", chosen)
             else:
@@ -369,26 +361,75 @@ def train(
             # Periodic evaluation
             if steps_done - last_eval_step >= eval_interval or steps_done >= total_timesteps:
                 last_eval_step = steps_done
-                # 1. Eval vs random
                 metrics_rnd = evaluate(ModelAgent(model), num_games=eval_games)
-                live.console.print(f"  [bold cyan]Eval vs Random:[/bold cyan] W/L/T=[{metrics_rnd['win_rate']:.2f}/{metrics_rnd['loss_rate']:.2f}/{metrics_rnd['tie_rate']:.2f}], "
-                      f"len={metrics_rnd['avg_game_length']:.1f}, "
-                      f"diff={metrics_rnd['avg_territory_diff']:.1f}")
-                
-                # 2. Eval vs a meaningful baseline (~500k steps behind current)
+                print(f"  Eval vs Random: W/L/T=[{metrics_rnd['win_rate']:.2f}/{metrics_rnd['loss_rate']:.2f}/{metrics_rnd['tie_rate']:.2f}], "
+                      f"len={metrics_rnd['avg_game_length']:.1f}, diff={metrics_rnd['avg_territory_diff']:.1f}", flush=True)
+
                 if len(past_models) >= 2:
                     target_step = steps_done - 500_000
-                    # Pick the checkpoint closest to target_step (but not the current one)
-                    baseline_path = min(
-                        past_models[:-1],
-                        key=lambda p: abs(get_step(p) - target_step),
-                    )
-                    dev = "mps" if torch.backends.mps.is_available() else "auto"
+                    baseline_path = min(past_models[:-1], key=lambda p: abs(get_step(p) - target_step))
+                    dev = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "auto")
                     baseline_model = MaskablePPO.load(baseline_path, env=env_to_use, device=dev)
                     metrics_base = evaluate(ModelAgent(model), num_games=eval_games, opponent=ModelAgent(baseline_model, deterministic=False))
-                    live.console.print(f"  [bold magenta]Eval vs {os.path.basename(baseline_path)}:[/bold magenta] W/L/T=[{metrics_base['win_rate']:.2f}/{metrics_base['loss_rate']:.2f}/{metrics_base['tie_rate']:.2f}], "
-                          f"len={metrics_base['avg_game_length']:.1f}, "
-                          f"diff={metrics_base['avg_territory_diff']:.1f}")
+                    print(f"  Eval vs {os.path.basename(baseline_path)}: W/L/T=[{metrics_base['win_rate']:.2f}/{metrics_base['loss_rate']:.2f}/{metrics_base['tie_rate']:.2f}], "
+                          f"len={metrics_base['avg_game_length']:.1f}, diff={metrics_base['avg_territory_diff']:.1f}", flush=True)
+
+    else:
+        # ---- Terminal mode: fancy rich UI ----
+        progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=None),
+            MofNCompleteColumn(),
+            "[progress.percentage]{task.percentage:>3.0f}%",
+            TimeElapsedColumn(),
+        )
+        task_id = progress.add_task("[orange3]Training Model...", total=total_timesteps, completed=steps_done)
+
+        with Live(refresh_per_second=4, console=None) as live:
+            ui_callback = CuteReporterCallback(live, progress, task_id, check_interval=10_000, total_steps=total_timesteps)
+
+            while steps_done < total_timesteps:
+                chunk = min(save_interval, total_timesteps - steps_done)
+                model.learn(total_timesteps=chunk, reset_num_timesteps=False, callback=ui_callback)
+                steps_done = model.num_timesteps
+
+                # Save checkpoint
+                path = os.path.join(save_dir, f"wallgo_{steps_done}")
+                model.save(path)
+                past_models.append(path)
+                total_games = ui_callback.wins + ui_callback.losses + ui_callback.ties
+                ui_callback.current_checkpoint = f"wallgo_{steps_done} ({total_games:,} games)"
+                live.console.print(f"[bold green]✓ Checkpoint saved: wallgo_{steps_done} (total games: {total_games:,})[/bold green]")
+
+                # Update opponent
+                if random.random() < 0.2:
+                    chosen = past_models[-1]
+                else:
+                    chosen = random.choice(past_models)
+                ui_callback.current_opponent = os.path.basename(chosen).replace(".zip", "")
+                live.console.print(f"[bold #FF9900]➜ Self-Play: Opponent → {ui_callback.current_opponent}[/bold #FF9900]")
+                if n_envs > 1:
+                    vec_env.env_method("set_opponent_path", chosen)
+                else:
+                    single_env.set_opponent_path(chosen)
+
+                # Periodic evaluation
+                if steps_done - last_eval_step >= eval_interval or steps_done >= total_timesteps:
+                    last_eval_step = steps_done
+                    metrics_rnd = evaluate(ModelAgent(model), num_games=eval_games)
+                    live.console.print(f"  [bold cyan]Eval vs Random:[/bold cyan] W/L/T=[{metrics_rnd['win_rate']:.2f}/{metrics_rnd['loss_rate']:.2f}/{metrics_rnd['tie_rate']:.2f}], "
+                          f"len={metrics_rnd['avg_game_length']:.1f}, "
+                          f"diff={metrics_rnd['avg_territory_diff']:.1f}")
+
+                    if len(past_models) >= 2:
+                        target_step = steps_done - 500_000
+                        baseline_path = min(past_models[:-1], key=lambda p: abs(get_step(p) - target_step))
+                        dev = "mps" if torch.backends.mps.is_available() else "auto"
+                        baseline_model = MaskablePPO.load(baseline_path, env=env_to_use, device=dev)
+                        metrics_base = evaluate(ModelAgent(model), num_games=eval_games, opponent=ModelAgent(baseline_model, deterministic=False))
+                        live.console.print(f"  [bold magenta]Eval vs {os.path.basename(baseline_path)}:[/bold magenta] W/L/T=[{metrics_base['win_rate']:.2f}/{metrics_base['loss_rate']:.2f}/{metrics_base['tie_rate']:.2f}], "
+                              f"len={metrics_base['avg_game_length']:.1f}, "
+                              f"diff={metrics_base['avg_territory_diff']:.1f}")
 
     # Save final model
     final_path = os.path.join(save_dir, "wallgo_final")
@@ -413,6 +454,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-envs", type=int, default=1,
                         help="Parallel envs (e.g. 4 or 8 for M1)")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
+    parser.add_argument("--no-ui", action="store_true", help="Plain text output (for Colab/notebooks)")
     args = parser.parse_args()
 
     train(
@@ -425,4 +467,5 @@ if __name__ == "__main__":
         eval_games=args.eval_games,
         n_envs=args.n_envs,
         resume=args.resume,
+        no_ui=args.no_ui,
     )
