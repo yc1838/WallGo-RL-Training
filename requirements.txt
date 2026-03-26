@@ -1,0 +1,7 @@
+pytest
+numpy
+gymnasium
+stable-baselines3[extra]
+sb3-contrib
+tensorboard
+torch
