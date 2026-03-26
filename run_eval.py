@@ -11,13 +11,13 @@ import numpy as np
 
 # 从我们自己写的 evaluate 文件中，导入评测函数 evaluate，和一直在瞎走的 RandomAgent
 from evaluate import evaluate, RandomAgent
-# 从 Stable Baselines 3 的高级算法库中，导入专门处理带有“不合法动作屏蔽”的近端策略优化算法（MaskablePPO）
+# 从 Stable Baselines 3 的高级算法库中，导入专门处理带有"不合法动作屏蔽"的近端策略优化算法（MaskablePPO）
 from sb3_contrib import MaskablePPO
 # 导入 PyTorch 深度学习框架
 import torch
 
 # PyTorch 默认会在算概率时做一些严格的底层校验，由于苹果电脑的 GPU（MPS）在某些偏门概率计算上由于兼容性问题还是个半残，
-# 时不时会炸个雷报错。所以我们需要强制把这里的“默认严格校验”关掉，让苹果显卡哪怕遇到一丁点数据偏差也不要大惊小怪，防止程序无缘无故中途崩溃罢工。
+# 时不时会炸个雷报错。所以我们需要强制把这里的"默认严格校验"关掉，让苹果显卡哪怕遇到一丁点数据偏差也不要大惊小怪，防止程序无缘无故中途崩溃罢工。
 torch.distributions.Distribution.set_default_validate_args(False)
 
 # 忽略所有的警告信息，这样在使用过程中你黑框框终端界面里看起来更干净清爽，不会红绿黄字乱飞
@@ -29,7 +29,7 @@ class RLAgent:
     # path: 你塞进去的那个装满神经大数据的 zip 压缩包路径
     # name: 我们随手贴在笼子上的一个人类可读的标签名（比如叫 "婴儿期"、"壮年期"）
     def __init__(self, path, name):
-        # 在屏幕上打印出：“正在从某某路径装载某某AI”，这样做是为了让你知道它没死机卡住
+        # 在屏幕上打印出："正在从某某路径装载某某AI"，这样做是为了让你知道它没死机卡住
         print(f"Loading {name} from {path}...")
         
         # 智能探测雷达：自动检查你这台电脑上到底有没有代表苹果最强 M 系算力的 MPS 引擎。
@@ -46,17 +46,17 @@ class RLAgent:
         self.name = name
 
     # 笼子唯一的开口处：每次轮到这个 AI 出手打架时，系统就会强制调用它这个大招函数
-    # obs: 游戏裁判推过来的“6x7x7 三重透视扫描阵列”，就是棋盘在它眼里的当前局势
-    # mask: 游戏裁判提前盖了公章的“违禁动作名单”，长达 9604 个判断位，告诉它“别往雷区里踩”
+    # obs: 游戏裁判推过来的"6x7x7 三重透视扫描阵列"，就是棋盘在它眼里的当前局势
+    # mask: 游戏裁判提前盖了公章的"违禁动作名单"，长达 9604 个判断位，告诉它"别往雷区里踩"
     def select_action(self, obs, mask, **kwargs):
         # 核心改动：把 deterministic=True 改成了 False！
         # 这样它在算题时就不会永远 100% 死板地只挑概率最高的那固定唯一的一招。
-        # 它会根据概率去“掷骰子”（比如 90% 选绝杀，5% 选另一招），从而让 2000 局打出 2000 种五花八门的神奇剧本！
+        # 它会根据概率去"掷骰子"（比如 90% 选绝杀，5% 选另一招），从而让 2000 局打出 2000 种五花八门的神奇剧本！
         action, _ = self.model.predict(obs, action_masks=mask, deterministic=False)
         # 由于预测出来的经常可能是包裹了无数封装的 numpy 层级数学格式的对象，我们粗暴地用 int() 把它碾碎成一个纯正的 Python 下乡整数。打出去。
         return int(action)
 
-# 定义一个类似于“测试主剧本”的宏大长篇函数，把你想要跑的擂台赛一次性写好全包揽
+# 定义一个类似于"测试主剧本"的宏大长篇函数，把你想要跑的擂台赛一次性写好全包揽
 def run_suite():
     # 找到硬盘上最接近 50万、100万、200万、250万以及最终大结局的压缩包路径
     final_path = "checkpoints/wallgo_final.zip"
@@ -116,9 +116,101 @@ def run_suite():
     # 最后的谢幕礼仪
     print("--- Evaluation Complete ---")
 
-# Python 独有的底层咒语结构。
-# 意思是说：如果你这个文件不是被别人当做附庸模块导入过去的（不是 import），
-# 而是“你，这个开发者本人从终端用敲入 `python run_eval.py` 这句强硬命令”直接当做最高主程序敲开来的。
-# 那么系统就会认定你是个大爷，立刻乖乖执行里面藏着的 run_suite 主测试函数！否则它只会装死假装啥也没看见！
+# ======================================================================
+# MCTS 对比擂台赛：同一个模型，不同搜索深度，到底差多少？
+# ======================================================================
+
+def run_mcts_comparison():
+    """Load model and compare PPO vs MCTS at different search depths."""
+    from mcts import MCTSAgent
+
+    # 找到最新的 checkpoint
+    final_path = "checkpoints/wallgo_final.zip"
+    if not os.path.exists(final_path):
+        # 没有 final，找最大步数的 checkpoint
+        import re
+        cps = []
+        for f in os.listdir("checkpoints"):
+            m = re.search(r'wallgo_(\d+)\.zip', f)
+            if m:
+                cps.append((int(m.group(1)), os.path.join("checkpoints", f)))
+        if not cps:
+            print("ERROR: No checkpoints found!")
+            return
+        cps.sort()
+        final_path = cps[-1][1]
+
+    print(f"Loading model from {final_path}...")
+    _dev = "mps" if torch.backends.mps.is_available() else "auto"
+    model = MaskablePPO.load(final_path, device=_dev)
+    print(f"Model loaded on: {model.device}")
+
+    # 创建不同搜索深度的选手
+    agent_ppo = RLAgent.__new__(RLAgent)
+    agent_ppo.model = model
+    agent_ppo.name = "PPO (no search)"
+    agent_ppo.select_action = lambda obs, mask, **kw: int(model.predict(obs, action_masks=mask, deterministic=False)[0])
+
+    agent_random = RandomAgent()
+    num_games = 50  # 先用 50 局快速验证，确认有效后再改成 200
+
+    print(f"\n{'='*60}")
+    print(f"  MCTS COMPARISON -- {num_games} games each")
+    print(f"{'='*60}\n")
+
+    # ---------- 第一组：不同搜索深度 vs Random ----------
+    print("--- Round 1: Different search depths vs Random ---\n")
+    print(f"{'Agent':<20} | {'Win%':<8} | {'Loss%':<8} | {'Tie%':<8} | {'Avg Len':<8} | {'Diff':<8} | {'Time':<8}")
+    print("-" * 80)
+
+    configs = [
+        ("PPO (no search)", None),
+        ("MCTS-10", 10),
+        ("MCTS-25", 25),
+        ("MCTS-50", 50),
+        ("MCTS-100", 100),
+    ]
+
+    agents = {}
+    for name, sims in configs:
+        if sims is None:
+            agent = agent_ppo
+        else:
+            agent = MCTSAgent(model, num_simulations=sims, temperature=0.0)
+        agents[name] = agent
+
+        print(f"  Evaluating {name} vs Random... ", end="", flush=True)
+        t0 = time.time()
+        res = evaluate(agent, num_games=num_games, opponent=agent_random)
+        elapsed = time.time() - t0
+        print(f"\r{name:<20} | {res['win_rate']*100:>5.1f}%  | {res['loss_rate']*100:>5.1f}%  | {res['tie_rate']*100:>5.1f}%  | {res['avg_game_length']:>6.1f}  | {res['avg_territory_diff']:>+6.1f}  | {elapsed:>5.1f}s")
+
+    # ---------- 第二组：MCTS vs 纯 PPO 直接对打 ----------
+    print(f"\n--- Round 2: MCTS vs Pure PPO (head-to-head) ---\n")
+    print(f"{'Matchup':<30} | {'Win%':<8} | {'Loss%':<8} | {'Tie%':<8} | {'Avg Len':<8}")
+    print("-" * 75)
+
+    for mcts_name in ["MCTS-25", "MCTS-50", "MCTS-100"]:
+        if mcts_name in agents:
+            print(f"  Evaluating {mcts_name} vs Pure PPO... ", end="", flush=True)
+            t0 = time.time()
+            res = evaluate(agents[mcts_name], num_games=num_games, opponent=agent_ppo)
+            elapsed = time.time() - t0
+            label = f"{mcts_name} vs PPO"
+            print(f"{label:<30} | {res['win_rate']*100:>5.1f}%  | {res['loss_rate']*100:>5.1f}%  | {res['tie_rate']*100:>5.1f}%  | {res['avg_game_length']:>6.1f}  | {elapsed:.1f}s")
+
+    print(f"\n{'='*60}")
+    print("  MCTS Comparison Complete!")
+    print(f"{'='*60}")
+
+
 if __name__ == "__main__":
-    run_suite()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mcts", action="store_true", help="Run MCTS comparison instead of standard eval")
+    args = parser.parse_args()
+
+    if args.mcts:
+        run_mcts_comparison()
+    else:
+        run_suite()

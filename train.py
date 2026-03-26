@@ -6,6 +6,16 @@ Usage:
 
 import argparse
 import os
+
+# CRITICAL: Prevent TensorFlow from grabbing the GPU and causing CUDA conflicts on Colab.
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+try:
+    import tensorflow as tf
+    tf.config.set_visible_devices([], 'GPU')
+except (ImportError, RuntimeError):
+    pass
+
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -177,14 +187,15 @@ def make_model(env, learning_rate: float = 1e-4, **kwargs) -> MaskablePPO:
 # ======================================================================
 
 class CuteReporterCallback(BaseCallback):
-    def __init__(self, live, progress, task_id, check_interval=10000, total_steps=100000):
+    def __init__(self, live, progress, task_id, check_interval=10000, total_steps=100000, persistent_stats=None):
         super().__init__()
         self.live = live
         self.progress = progress
         self.task_id = task_id
         self.check_interval = check_interval
         self.total_steps = total_steps
-        
+        self.persistent_stats = persistent_stats or {}
+
         self.wins = 0
         self.losses = 0
         self.ties = 0
@@ -194,11 +205,53 @@ class CuteReporterCallback(BaseCallback):
         self.last_recent_games = 0
         self.current_checkpoint = "—"
         self.current_opponent = "Random"
+        self.last_eval_result = "pending..."
+        self.event_log = []  # recent events shown in the panel
         
+    def log_event(self, msg):
+        """Add an event to the in-panel log and immediately refresh the panel."""
+        self.event_log.append(msg)
+        self._refresh_panel()
+
+    def _refresh_panel(self):
+        """Rebuild and display the panel with current stats."""
+        total = self.wins + self.losses + self.ties
+        win_rate_all = (self.wins / max(1, total)) * 100
+        all_time_games = self.persistent_stats.get("total_games", 0) + total
+        recent_wr = (self.last_recent_wins / max(1, self.last_recent_games)) * 100 if self.last_recent_games else win_rate_all
+        session_steps = self.num_timesteps - self._start_timesteps if hasattr(self, '_start_timesteps') else self.num_timesteps
+
+        cyber_title = "[bold #ff00ff]///[/bold #ff00ff] [bold #00ffcc]NEURAL-LNK SYS // WALLGO-RL[/bold #00ffcc] [bold #ff00ff]///[/bold #ff00ff]"
+        stats_text = f"""
+[bold #00ffcc]▰▰▰ SYSTEM METRICS ▰▰▰[/bold #00ffcc]
+[bold #ff00ff]▶ THIS SESSION:[/bold #ff00ff] [bold white]{total:,} games | {session_steps:,} steps[/bold white]  [bold #b0b0b0]ALL TIME: {all_time_games:,} games[/bold #b0b0b0]
+[bold #ff00ff]▶ WIN / LOSS / TIE:[/bold #ff00ff] [bold #00FF00]{self.wins:,}[/bold #00FF00] / [bold #FF0055]{self.losses:,}[/bold #FF0055] / [bold #00CCFF]{self.ties:,}[/bold #00CCFF]
+
+[bold #fcee0a]▰▰▰ ALGORITHMIC EFFICIENCY ▰▰▰[/bold #fcee0a]
+[bold #fcee0a]▶ GLOBAL WIN RATE:[/bold #fcee0a] [bold white]{win_rate_all:.1f}%[/bold white]
+[bold #fcee0a]▶ RECENT WIN RATE (last {self.check_interval:,} steps):[/bold #fcee0a] [bold white]{recent_wr:.1f}%[/bold white]
+
+[bold #87CEEB]▰▰▰ CHECKPOINT STATUS ▰▰▰[/bold #87CEEB]
+[bold #87CEEB]▶ LATEST SAVE:[/bold #87CEEB] [bold white]{self.current_checkpoint}[/bold white]
+[bold #87CEEB]▶ CURRENT OPPONENT:[/bold #87CEEB] [bold white]{self.current_opponent}[/bold white]
+
+[bold #FF6B6B]▰▰▰ EVAL vs RANDOM ▰▰▰[/bold #FF6B6B]
+[bold #FF6B6B]▶ LAST RESULT:[/bold #FF6B6B] [bold white]{self.last_eval_result}[/bold white]
+
+[bold #b0b0b0]▰▰▰ EVENT LOG ▰▰▰[/bold #b0b0b0]
+""" + "\n".join(self.event_log[-20:])
+        group = Group(
+            Text.from_markup(stats_text, justify="left"),
+            self.progress
+        )
+        self.live.update(Panel(group, title=cyber_title, border_style="#00ffcc", padding=(1, 2)))
+
     def _on_step(self):
         viz_completed = min(self.num_timesteps, self.total_steps)
         self.progress.update(self.task_id, completed=viz_completed)
-        
+        if not hasattr(self, '_start_timesteps'):
+            self._start_timesteps = self.num_timesteps
+
         for info in self.locals.get("infos", []):
             if "result" in info:
                 self.recent_games += 1
@@ -209,44 +262,35 @@ class CuteReporterCallback(BaseCallback):
                     self.losses += 1
                 elif info["result"] == "tie":
                     self.ties += 1
-                    
+
         if self.n_calls % 100 == 0:
-            total = self.wins + self.losses + self.ties
-            win_rate_all = (self.wins / max(1, total)) * 100
-            
             if self.n_calls % self.check_interval == 0:
                 self.last_recent_wins = self.recent_wins
                 self.last_recent_games = self.recent_games
                 self.recent_wins = 0
                 self.recent_games = 0
-                
-            recent_wr = (self.last_recent_wins / max(1, self.last_recent_games)) * 100 if self.last_recent_games else win_rate_all
-            
-            cyber_title = "[bold #ff00ff]///[/bold #ff00ff] [bold #00ffcc]NEURAL-LNK SYS // WALLGO-RL[/bold #00ffcc] [bold #ff00ff]///[/bold #ff00ff]"
-            stats_text = f"""
-[bold #00ffcc]▰▰▰ SYSTEM METRICS ▰▰▰[/bold #00ffcc]
-[bold #ff00ff]▶ TOTAL GAMES PLAYED:[/bold #ff00ff] [bold white]{total:,}[/bold white]
-[bold #ff00ff]▶ WIN / LOSS / TIE:[/bold #ff00ff] [bold #00FF00]{self.wins:,}[/bold #00FF00] / [bold #FF0055]{self.losses:,}[/bold #FF0055] / [bold #00CCFF]{self.ties:,}[/bold #00CCFF]
+            self._refresh_panel()
 
-[bold #fcee0a]▰▰▰ ALGORITHMIC EFFICIENCY ▰▰▰[/bold #fcee0a]
-[bold #fcee0a]▶ GLOBAL WIN RATE:[/bold #fcee0a] [bold white]{win_rate_all:.1f}%[/bold white]
-[bold #fcee0a]▶ RECENT WIN RATE (last {self.check_interval:,} steps):[/bold #fcee0a] [bold white]{recent_wr:.1f}%[/bold white]
-
-[bold #87CEEB]▰▰▰ CHECKPOINT STATUS ▰▰▰[/bold #87CEEB]
-[bold #87CEEB]▶ LATEST SAVE:[/bold #87CEEB] [bold white]{self.current_checkpoint}[/bold white]
-[bold #87CEEB]▶ CURRENT OPPONENT:[/bold #87CEEB] [bold white]{self.current_opponent}[/bold white]
-"""
-            group = Group(
-                Text.from_markup(stats_text, justify="left"),
-                self.progress
-            )
-            self.live.update(Panel(group, title=cyber_title, border_style="#00ffcc", padding=(1, 2)))
-            
         return True
 
 # ======================================================================
 # Training loop
 # ======================================================================
+
+def _save_stats(stats_path, persistent_stats, session_wins, session_losses, session_ties):
+    """Update persistent stats file with current session's game counts."""
+    import json
+    base_games = persistent_stats.get("_base_games", 0)
+    base_wins = persistent_stats.get("_base_wins", 0)
+    base_losses = persistent_stats.get("_base_losses", 0)
+    base_ties = persistent_stats.get("_base_ties", 0)
+    persistent_stats["total_games"] = base_games + session_wins + session_losses + session_ties
+    persistent_stats["total_wins"] = base_wins + session_wins
+    persistent_stats["total_losses"] = base_losses + session_losses
+    persistent_stats["total_ties"] = base_ties + session_ties
+    with open(stats_path, "w") as f:
+        json.dump(persistent_stats, f)
+
 
 def train(
     total_timesteps: int = 100_000,
@@ -274,6 +318,23 @@ def train(
             past_models.append(os.path.join(save_dir, f))
     past_models = sorted(past_models, key=get_step)
 
+    # Load persistent stats (total games across all sessions)
+    import json
+    stats_path = os.path.join(save_dir, "stats.json")
+    persistent_stats = {"total_games": 0, "total_wins": 0, "total_losses": 0, "total_ties": 0}
+    if os.path.exists(stats_path):
+        try:
+            with open(stats_path) as f:
+                persistent_stats.update(json.load(f))
+            print(f"[startup] Loaded stats: {persistent_stats['total_games']:,} games played historically")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    # Remember the base counts so this session's games are added on top
+    persistent_stats["_base_games"] = persistent_stats.get("total_games", 0)
+    persistent_stats["_base_wins"] = persistent_stats.get("total_wins", 0)
+    persistent_stats["_base_losses"] = persistent_stats.get("total_losses", 0)
+    persistent_stats["_base_ties"] = persistent_stats.get("total_ties", 0)
+
     # Setup Environment
     if n_envs > 1:
         def _make():
@@ -293,12 +354,22 @@ def train(
         last_eval_step = steps_done
         
         # Override saved hyperparameters to speed up the "thinking" phase
-        _device = "mps" if torch.backends.mps.is_available() else "auto"
+        _device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "auto")
         custom_objects = {
             "learning_rate": learning_rate,
             "n_epochs": 4,          # Reduced from 10 to 4 for 2.5x faster gradient updates
         }
         model = MaskablePPO.load(latest, env=env_to_use, device=_device, custom_objects=custom_objects)
+        # The model's internal num_timesteps may differ from the filename number
+        # (e.g. from previous training runs). Use the real counter so the while-loop
+        # and model.learn() agree on where we are.
+        steps_done = model.num_timesteps
+        last_eval_step = steps_done
+        # When resuming, --steps means "train for X MORE steps", not "train until step X".
+        # So we shift the target forward by the current position.
+        total_timesteps = steps_done + total_timesteps
+        print(f"[resume] Loaded {latest}, internal step counter: {steps_done:,}")
+        print(f"[resume] Will train until step {total_timesteps:,} (+{total_timesteps - steps_done:,} more)")
     else:
         policy_kwargs = dict(
             features_extractor_class=WallGoCNN,
@@ -315,26 +386,52 @@ def train(
             n_epochs=4,             # Reduced from 10 to 4 for faster updates
             gamma=0.99,
             verbose=0,
-            device="mps" if torch.backends.mps.is_available() else "auto",
+            device="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "auto"),
         )
 
     # Print startup diagnostics so you can verify device & engine
     print(f"[startup] PyTorch device: {model.device}")
     print(f"[startup] MPS available: {torch.backends.mps.is_available()}")
+    print(f"[startup] Steps: {steps_done:,} / {total_timesteps:,}")
     try:
         import wallgo_rs
         print("[startup] Engine: Rust (wallgo_rs)")
     except ImportError:
         print("[startup] Engine: Python (wallgo.py)")
 
+    # Quick sanity check: 20 games vs Random so you immediately see if the model works
+    import time as _time
+    print("[startup] Running quick eval: 20 games vs Random...", flush=True)
+    _t0 = _time.time()
+    _quick = evaluate(ModelAgent(model), num_games=20)
+    print(f"[startup] Quick eval: W={_quick['win_rate']:.0%} L={_quick['loss_rate']:.0%} T={_quick['tie_rate']:.0%} "
+          f"len={_quick['avg_game_length']:.0f} ({_time.time()-_t0:.1f}s)", flush=True)
+    print("[startup] Starting training loop...", flush=True)
+
     if no_ui:
         # ---- Colab / headless mode: plain print, no rich ----
         import sys, time as _time
         _train_start = _time.time()
 
+        # Simple callback to count games in headless mode
+        class _GameCounter(BaseCallback):
+            def __init__(self):
+                super().__init__()
+                self.wins = 0; self.losses = 0; self.ties = 0
+            def _on_step(self):
+                for info in self.locals.get("infos", []):
+                    r = info.get("result")
+                    if r == "win": self.wins += 1
+                    elif r == "loss": self.losses += 1
+                    elif r == "tie": self.ties += 1
+                return True
+        _counter = _GameCounter()
+
         while steps_done < total_timesteps:
             chunk = min(save_interval, total_timesteps - steps_done)
-            model.learn(total_timesteps=chunk, reset_num_timesteps=False)
+            # SB3 internally adds model.num_timesteps when reset_num_timesteps=False,
+            # so we pass the INCREMENTAL chunk, not an absolute target.
+            model.learn(total_timesteps=chunk, reset_num_timesteps=False, callback=_counter)
             steps_done = model.num_timesteps
 
             elapsed = _time.time() - _train_start
@@ -346,6 +443,7 @@ def train(
             model.save(path)
             past_models.append(path)
             print(f"  ✓ Checkpoint saved: wallgo_{steps_done}", flush=True)
+            _save_stats(stats_path, persistent_stats, _counter.wins, _counter.losses, _counter.ties)
 
             # Update opponent
             if random.random() < 0.2:
@@ -386,10 +484,12 @@ def train(
         task_id = progress.add_task("[orange3]Training Model...", total=total_timesteps, completed=steps_done)
 
         with Live(refresh_per_second=4, console=None) as live:
-            ui_callback = CuteReporterCallback(live, progress, task_id, check_interval=10_000, total_steps=total_timesteps)
+            ui_callback = CuteReporterCallback(live, progress, task_id, check_interval=10_000, total_steps=total_timesteps, persistent_stats=persistent_stats)
 
             while steps_done < total_timesteps:
                 chunk = min(save_interval, total_timesteps - steps_done)
+                # SB3 internally adds model.num_timesteps when reset_num_timesteps=False,
+                # so we pass the INCREMENTAL chunk, not an absolute target.
                 model.learn(total_timesteps=chunk, reset_num_timesteps=False, callback=ui_callback)
                 steps_done = model.num_timesteps
 
@@ -399,7 +499,9 @@ def train(
                 past_models.append(path)
                 total_games = ui_callback.wins + ui_callback.losses + ui_callback.ties
                 ui_callback.current_checkpoint = f"wallgo_{steps_done} ({total_games:,} games)"
-                live.console.print(f"[bold green]✓ Checkpoint saved: wallgo_{steps_done} (total games: {total_games:,})[/bold green]")
+                ui_callback.log_event(f"[bold green]>> Saved: wallgo_{steps_done}[/bold green]")
+                # Persist cumulative stats
+                _save_stats(stats_path, persistent_stats, ui_callback.wins, ui_callback.losses, ui_callback.ties)
 
                 # Update opponent
                 if random.random() < 0.2:
@@ -407,7 +509,7 @@ def train(
                 else:
                     chosen = random.choice(past_models)
                 ui_callback.current_opponent = os.path.basename(chosen).replace(".zip", "")
-                live.console.print(f"[bold #FF9900]➜ Self-Play: Opponent → {ui_callback.current_opponent}[/bold #FF9900]")
+                ui_callback.log_event(f"[bold #FF9900]>> Opponent -> {ui_callback.current_opponent}[/bold #FF9900]")
                 if n_envs > 1:
                     vec_env.env_method("set_opponent_path", chosen)
                 else:
@@ -416,20 +518,21 @@ def train(
                 # Periodic evaluation
                 if steps_done - last_eval_step >= eval_interval or steps_done >= total_timesteps:
                     last_eval_step = steps_done
+                    ui_callback.last_eval_result = "evaluating..."
+                    ui_callback.log_event("[bold cyan]>> Running eval vs Random...[/bold cyan]")
                     metrics_rnd = evaluate(ModelAgent(model), num_games=eval_games)
-                    live.console.print(f"  [bold cyan]Eval vs Random:[/bold cyan] W/L/T=[{metrics_rnd['win_rate']:.2f}/{metrics_rnd['loss_rate']:.2f}/{metrics_rnd['tie_rate']:.2f}], "
-                          f"len={metrics_rnd['avg_game_length']:.1f}, "
-                          f"diff={metrics_rnd['avg_territory_diff']:.1f}")
+                    eval_str = f"W={metrics_rnd['win_rate']:.0%} L={metrics_rnd['loss_rate']:.0%} T={metrics_rnd['tie_rate']:.0%} len={metrics_rnd['avg_game_length']:.0f} diff={metrics_rnd['avg_territory_diff']:+.1f}"
+                    ui_callback.last_eval_result = f"{eval_str}  (@ step {steps_done:,})"
+                    ui_callback.log_event(f"[bold cyan]>> Eval: {eval_str}[/bold cyan]")
 
                     if len(past_models) >= 2:
                         target_step = steps_done - 500_000
                         baseline_path = min(past_models[:-1], key=lambda p: abs(get_step(p) - target_step))
-                        dev = "mps" if torch.backends.mps.is_available() else "auto"
+                        dev = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "auto")
                         baseline_model = MaskablePPO.load(baseline_path, env=env_to_use, device=dev)
                         metrics_base = evaluate(ModelAgent(model), num_games=eval_games, opponent=ModelAgent(baseline_model, deterministic=False))
-                        live.console.print(f"  [bold magenta]Eval vs {os.path.basename(baseline_path)}:[/bold magenta] W/L/T=[{metrics_base['win_rate']:.2f}/{metrics_base['loss_rate']:.2f}/{metrics_base['tie_rate']:.2f}], "
-                              f"len={metrics_base['avg_game_length']:.1f}, "
-                              f"diff={metrics_base['avg_territory_diff']:.1f}")
+                        base_str = f"W={metrics_base['win_rate']:.0%} L={metrics_base['loss_rate']:.0%} T={metrics_base['tie_rate']:.0%} len={metrics_base['avg_game_length']:.0f}"
+                        ui_callback.log_event(f"[bold magenta]>> vs {os.path.basename(baseline_path)}: {base_str}[/bold magenta]")
 
     # Save final model
     final_path = os.path.join(save_dir, "wallgo_final")

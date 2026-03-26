@@ -9,8 +9,28 @@
 
 # argparse 库用来让我们可以在黑框框（终端）里轻松打命令传参数（比如 --num-games 10）
 import argparse
-# 镇馆之宝 numpy（简写np），用来做大规模矩阵数学运算
+import os
+import sys
+
+# CRITICAL: Prevent TensorFlow from grabbing the GPU and causing CUDA conflicts on Colab.
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+try:
+    import tensorflow as tf
+    tf.config.set_visible_devices([], 'GPU')
+except (ImportError, RuntimeError):
+    pass
+
 import numpy as np
+import torch
+import torch.nn as nn
+# Disable strict validation — newer PyTorch's Simplex check rejects valid
+# masked distributions due to floating-point normalization in large action spaces.
+torch.distributions.Distribution.set_default_validate_args(False)
+
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 # 敲代码时用的声明标注，没有任何实际执行作用，只是告诉程序员这里可以为空（Optional）或者是一个字典（Dict）
 from typing import Optional, Dict
 
@@ -24,8 +44,50 @@ except ImportError:
 from wallgo_gym import WallGoGymEnv
 # 把那些把数字翻译成人话的双向解析器也带上
 from action_encoding import (
-    ACTION_SPACE_SIZE, decode_action, encode_action, get_action_mask,
+    ACTION_SPACE_SIZE, decode_action, encode_action, get_action_mask, BOARD_SIZE
 )
+from gymnasium import spaces
+
+# ======================================================================
+# 第一梯队：模型架构与代理（Neural Network & Agents）
+# ======================================================================
+
+class WallGoCNN(BaseFeaturesExtractor):
+    """跟 train.py 里的架构必须一模一样，否则模型加载不出来。"""
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 256):
+        super().__init__(observation_space, features_dim)
+        n_input_channels = observation_space.shape[0]
+        self.cnn = nn.Sequential(
+            nn.Conv2d(n_input_channels, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            sample = torch.as_tensor(observation_space.sample()[None]).float()
+            n_flatten = self.cnn(sample).shape[1]
+            
+        self.linear = nn.Sequential(
+            nn.Linear(n_flatten, features_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.linear(self.cnn(observations))
+
+class ModelAgent:
+    """包装了神经网络模型的代理。"""
+    def __init__(self, model, deterministic=True):
+        self.model = model
+        self.deterministic = deterministic
+
+    def select_action(self, obs, mask, **kwargs):
+        # 核心：根据模型预测下一步。如果是评估模式，通常 deterministic=True。
+        action, _ = self.model.predict(obs, action_masks=mask, deterministic=self.deterministic)
+        return int(action)
 
 
 # ======================================================================
@@ -131,79 +193,80 @@ def evaluate(
     测试选手（agent）永远固定执红方，占据天生的偶数回合（0, 2, 4...）。
     对手（opponent）永远执蓝方，在奇数回合还击。
     直到一方死亡或超时。
+    直到一方死亡或超时。
     """
-    # 如果没给他挑对手，系统就贴心地给它塞个什么都不懂的随机瞎走傻子让它练手
     if opponent is None:
         opponent = RandomAgent()
 
-    # 如果说打的局数是 0 局。。。耍我呢？直接原地返回四个鸭蛋，退朝！
     if num_games == 0:
         return {"win_rate": 0.0, "loss_rate": 0.0, "tie_rate": 0.0, "avg_game_length": 0.0, "avg_territory_diff": 0.0}
 
-    # 准备五个厚厚的小本本，开始画正字记战绩：
-    wins = 0                 # 第一选手赢了几把
-    losses = 0               # 输了几把
-    ties = 0                 # 平了几把
-    total_length = 0         # 所有对局回合数加起来（用于最后算平均每局多长）
-    total_territory_diff = 0.0 # 所有局里，打完后净胜地主多大（看看是碾压还是险胜）
+    progressBar = num_games > 10 # 局数多的时候才显示进度
 
-    # 开始进入暗无天日的“无数局”死循环
-    for _ in range(num_games):
-        # 召唤出一个全新的角斗场环境壳子，我们刻意把“给糖果”的辅助训练关掉（False），纯粹看真枪实弹的你死我活
+    # 记账本：不仅记总分，还要记谁在什么位置赢的。
+    stats = {
+        "red_starts": 0, "red_wins": 0, "blue_starts": 0, "blue_wins": 0,
+        "total_len": 0, "total_diff": 0.0, "total_wins": 0, "total_losses": 0, "total_ties": 0
+    }
+
+    for i in range(num_games):
+        if progressBar and (i + 1) % max(1, (num_games // 10)) == 0:
+            print(f"  > Progress: {i+1}/{num_games} games...", flush=True)
+
         env = WallGoGymEnv(max_turns=max_turns, reward_shaping=False)
-        # 上一盆冷水，把棋盘重置
         obs, info = env.reset()
-        # 挂上倒计时牌（从 0 回合起算）
         turn = 0
-        game_reward = 0.0
+        
+        # 奇偶轮换：一半局 agent 先手 (RED)，一半局 agent 后手 (BLUE)
+        agent_is_red = (i % 2 == 0)
+        if agent_is_red: stats["red_starts"] += 1
+        else: stats["blue_starts"] += 1
 
-        # 进入这一盘游戏的至死方休内循环
         while True:
-            # 裁判拿出红红绿绿的通行掩码打分卡
             mask = env.action_masks()
-            # 瞄一眼里面还有没有活路可走
-            legal = np.where(mask)[0]
-            # 如果实在无路可走（比如被堵死了），强行冲破天际结束这场比赛
-            if len(legal) == 0:
-                break
+            if not mask.any(): break
 
-            # 回合数是偶数时，轮到受试一号兵出列挑选动作
-            if turn % 2 == 0:
+            # 轮到谁走？
+            is_agent_turn = (turn % 2 == 0) if agent_is_red else (turn % 2 != 0)
+
+            if is_agent_turn:
                 action = agent.select_action(obs, mask, env=env)
-            # 奇数回合，由敌人二号兵选动作
             else:
                 action = opponent.select_action(obs, mask, env=env)
 
-            # 把最终被双房决定的那个宿命 action 号码球，塞回大厅去推进局势进度！
-            # 瞬间吐出了下一局的天翻地覆的格局 obs，生死存亡 terminated，和裁决结果 info
             obs, reward, terminated, truncated, info = env.step(action)
-            # 熬过一个回合，计分板上加一。
             turn += 1
 
-            # 查房：要么因为有人真刀真枪拿下了对局（terminated），要么硬生生抗到了 200 回合被腰斩掐线（truncated）
             if terminated or truncated:
-                # 判断是真枪真刀分出的胜负，且系统有乖巧地在底层给出各个红蓝的分数
-                if terminated and "scores" in info:
+                if "scores" in info:
                     scores = info["scores"]
-                    # 测试选手永远是掌控大局的傲慢红方
-                    agent_score = scores.get("RED", 0)
-                    # 假想敌永远是蓝方
-                    opp_score = scores.get("BLUE", 0)
-                    # 计入总分差的大本本（用来最后评估那个人打赢这一局到底是靠虐菜还是只赢了一里地）
-                    total_territory_diff += agent_score - opp_score
+                    red_s, blue_s = scores.get("RED", 0), scores.get("BLUE", 0)
                     
-                    # 极其朴素正面的判决书：
-                    if agent_score > opp_score:
-                        wins += 1    # 大赚特赚
-                    elif agent_score < opp_score:
-                        losses += 1  # 惨遭反杀
+                    if agent_is_red:
+                        me, opp = red_s, blue_s
+                        if me > opp: stats["red_wins"] += 1
                     else:
-                        ties += 1    # 苟出天际和平收尾
+                        me, opp = blue_s, red_s
+                        if me > opp: stats["blue_wins"] += 1
 
-                # 无论如何，把这一把长达几十回合的寿命刻在计步本上
-                total_length += turn
-                # 一把打完，直接从当前的比赛里 Break 撕破结界出去，去开启下一个 for 重生对决循环
+                    stats["total_diff"] += (me - opp)
+                    if me > opp: stats["total_wins"] += 1
+                    elif me < opp: stats["total_losses"] += 1
+                    else: stats["total_ties"] += 1
+
+                stats["total_len"] += turn
                 break
+    
+    # 汇总
+    return {
+        "win_rate": stats["total_wins"] / num_games,
+        "loss_rate": stats["total_losses"] / num_games,
+        "tie_rate": stats["total_ties"] / num_games,
+        "red_win_rate": stats["red_wins"] / max(1, stats["red_starts"]),
+        "blue_win_rate": stats["blue_wins"] / max(1, stats["blue_starts"]),
+        "avg_game_length": stats["total_len"] / num_games,
+        "avg_territory_diff": stats["total_diff"] / num_games,
+    }
 
     # 当千锤百炼的 2000 把全部打完。
     # 我们把刚才记的五个小本本里的战果，统统除以总参战场数，得出非常神圣的百分率或平均值字典抛回人间！
@@ -222,24 +285,80 @@ def evaluate(
 
 # 和刚才那堆代码同理：如果你在外界直接生硬地打命令行 `python evaluate.py --agent greedy`。
 # 那这个 `__main__` 条件就会苏醒。
+def run_arena(steps_list=[50000, 1500000, 3500000], num_games=20, deterministic=True):
+    """【竞技场模式】自动对比多个时间点的自己。"""
+    import re
+    cp_dir = "checkpoints"
+    if not os.path.exists(cp_dir):
+        print(f"Error: {cp_dir} 文件夹不存在！")
+        return
+
+    # 1. 找齐所有 checkpoint
+    all_files = os.listdir(cp_dir)
+    past_models = []
+    for f in all_files:
+        if f.startswith("wallgo_") and f.endswith(".zip"):
+            m = re.search(r'wallgo_(\d+)', f)
+            if m: past_models.append((int(m.group(1)), os.path.join(cp_dir, f)))
+    past_models.sort()
+
+    # 2. 加载最强的（也就是最新的）作为擂主
+    final_path = os.path.join(cp_dir, "wallgo_final.zip")
+    if not os.path.exists(final_path) and past_models:
+        final_path = past_models[-1][1]
+    
+    _dev = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\n[Arena] 加载主模型 (擂主): {final_path} ...")
+    main_model = MaskablePPO.load(final_path, device=_dev)
+    main_agent = ModelAgent(main_model, deterministic=deterministic)
+
+    print(f"{'Opponent':<20} | {'W/L/T Rate':<18} | {'RED WR':<8} | {'BLUE WR':<8} | {'Len/Diff':<12}")
+    print("-" * 75)
+
+    # 3. 逐个对战
+    targets = sorted(steps_list)
+    for target in targets:
+        # 寻找最接近 target 步数的模型
+        if not past_models: break
+        closest = min(past_models, key=lambda x: abs(x[0] - target))
+        opp_path = closest[1]
+        opp_step = closest[0]
+
+        print(f"正在加载对手 ({opp_step:,} steps)... ", end="", flush=True)
+        opp_model = MaskablePPO.load(opp_path, device=_dev)
+        opp_agent = ModelAgent(opp_model, deterministic=deterministic)
+        
+        res = evaluate(main_agent, num_games=num_games, opponent=opp_agent)
+        rate_str = f"{res['win_rate']:.2f}/{res['loss_rate']:.2f}/{res['tie_rate']:.2f}"
+        ld_str = f"{res['avg_game_length']:.1f}/{res['avg_territory_diff']:.1f}"
+        print(f"\r{os.path.basename(opp_path):<20} | {rate_str:<18} | {res['red_win_rate']:.2f}   | {res['blue_win_rate']:.2f}   | {ld_str:<12}")
+
+    # 4. 最后测一下随机沙包
+    print(f"正在测试 RandomAgent... ", end="", flush=True)
+    res_rnd = evaluate(main_agent, num_games=num_games, opponent=RandomAgent())
+    rate_str = f"{res_rnd['win_rate']:.2f}/{res_rnd['loss_rate']:.2f}/{res_rnd['tie_rate']:.2f}"
+    ld_str = f"{res_rnd['avg_game_length']:.1f}/{res_rnd['avg_territory_diff']:.1f}"
+    print(f"\r{'RandomAgent':<20} | {rate_str:<18} | {res_rnd['red_win_rate']:.2f}   | {res_rnd['blue_win_rate']:.2f}   | {ld_str:<12}")
+
 if __name__ == "__main__":
-    # 解析你这人类在黑屏幕里打的参数，什么 `--num-games` 呀之类的
     parser = argparse.ArgumentParser(description="Evaluate WallGo agents")
     parser.add_argument("--num-games", type=int, default=20)
+    parser.add_argument("--arena", action="store_true", help="Run multi-checkpoint comparison")
+    parser.add_argument("--steps", type=str, default="50000,1500000,3500000", help="Steps for arena")
+    parser.add_argument("--stochastic", action="store_true", help="Use sampling instead of greedy actions")
+    
     parser.add_argument("--agent", choices=["random", "greedy"], default="random")
     parser.add_argument("--opponent", choices=["random", "greedy"], default="random")
     args = parser.parse_args()
 
-    # 弄一个快捷翻译簿：如果你输入 'random'，我就把 RandomAgent 类的本体当成大礼送上
-    agents = {"random": RandomAgent, "greedy": GreedyAgent}
-    # 实例化这俩货色
-    agent = agents[args.agent]()
-    opponent = agents[args.opponent]()
-
-    # 调用上面那个大裁判，丢进去开打！
-    metrics = evaluate(agent, num_games=args.num_games, opponent=opponent)
-    
-    # 比赛落幕，在你的黑框屏幕上打印这些金光闪闪的大字结果
-    print(f"Results ({args.num_games} games):")
-    for k, v in metrics.items():
-        print(f"  {k}: {v:.3f}")
+    if args.arena:
+        steps = [int(s) for s in args.steps.split(",")]
+        run_arena(steps_list=steps, num_games=args.num_games, deterministic=not args.stochastic)
+    else:
+        agents = {"random": RandomAgent, "greedy": GreedyAgent}
+        agent = agents[args.agent]()
+        opponent = agents[args.opponent]()
+        metrics = evaluate(agent, num_games=args.num_games, opponent=opponent)
+        print(f"Results ({args.num_games} games, deterministic={not args.stochastic}):")
+        for k, v in metrics.items():
+            print(f"  {k}: {v:.3f}")
